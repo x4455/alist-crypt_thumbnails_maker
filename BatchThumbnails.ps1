@@ -22,7 +22,6 @@ if (Get-Command ffmpeg -ErrorAction SilentlyContinue) {
         # 等待用户按键
         Write-Host "Press any key to exit..."
         Read-Host
-
         # 退出脚本
         exit
     }
@@ -30,13 +29,11 @@ if (Get-Command ffmpeg -ErrorAction SilentlyContinue) {
 
 ##### 自定义部分 #####
 
-# 其他参数（可调参数）
-# 质量 -q:v 25 | 压缩 -compression_level 4 | 循环次数 -loop 0 | 覆盖文件 -y / -n
-$otherArgForSlide = "-q:v 25 -compression_level 4 -loop 0 -n" # 动态图
-$otherArgForPreview = "-lossless 0 -quality 40 -loop 0 -n" # 预览图
+# 超过这个时长的都将使用预览图
+$durationLimit = 600 # 10min
 
 # 动态选择 帧步长
-function Set-AdjustFrameInterval {
+function Set-FrameInterval {
     param(
         [Parameter(Mandatory=$true)]
         [int]$durationInSeconds,
@@ -44,11 +41,9 @@ function Set-AdjustFrameInterval {
         [int]$framePerSecond
     )
 
-    # 初始根据视频时长设定基础的frameInterval
-    $frameInterval = 60
-        # 短视频转动态图（可调参数）
-    if ($durationInSeconds -lt 600) { # 10min
-        if       ($durationInSeconds -le 60) { # 1m:
+    # 短视频转动态图（可调参数）
+    if ($durationInSeconds -lt $durationLimit) {
+        if       ($durationInSeconds -le 60) {  # 1m:
             $frameInterval = 5
         } elseif ($durationInSeconds -le 120) { # 2m:
             $frameInterval = 30
@@ -68,52 +63,63 @@ function Set-AdjustFrameInterval {
         $adjustmentFactor = [Math]::Round($framePerSecond / 30)
         $frameInterval = [Math]::Ceiling($frameInterval * $adjustmentFactor)
 
-        # 顺便定义其他参数
-        $global:otherArg = $otherArgForSlide
     } else {
-        # 长视频转预览图（可调参数）：时长/画面总数*帧数
+        # 长视频转预览图：时长/画面总数（可调参数）*帧数
         $frameInterval = $durationInSeconds / 12 * $framePerSecond
         # 使用[Math]::Floor进行向下取整，确保结果为整数且不进则退
         $frameInterval = [Math]::Floor($frameInterval)
-
-        # 顺便定义其他参数
-        $global:otherArg = $otherArgForPreview
     }
-    Write-Debug "$global:otherArg"
     return [int]$frameInterval
 }
 
 # 动态选择 滤镜参数
-function Set-AdjustVFchainArg {
+function Set-VFchainArg {
     param(
         [Parameter(Mandatory=$true)]
         [int]$frameInterval
     )
 
-    # VF参数
-    # thumbnail=n=$frameInterval  缩略图滤镜，出图体积小但非常耗时
-    # selcte=not(mod(n\,$frameInterval))  步长取帧，快速出图
+    # VF参数（可调参数）
+    # thumbnail=n=$frameInterval  缩略图滤镜，出图体积小点但非常耗时
+    # selcte=not(mod(n\,$frameInterval))  指定步长取帧，快速出图
     # scale=-1:320  自动宽度，高度为320像素
     # tile=3X4:padding=1:color=black 3x4网格，之间填充1个像素，填充颜色为黑色
+    $VFchainArgForSlide = "select=not(mod(n\,$frameInterval)),scale=-1:300" # 动态图
+    $VFchainArgForPreview = "select=not(mod(n\,$frameInterval)),scale=-1:320,tile=3X4:padding=1:color=black" # 预览图
 
-    # 根据帧步长选择生成动态图或者预览图
-    if ($frameInterval -lt 1800) {
-        # 动态图（可调参数）
-        $Arg = "select=not(mod(n\,$frameInterval)),scale=-1:300"
+    # 根据帧步长选择滤镜参数
+    if ($frameInterval -lt 1800) { # 30FPS下这都60秒/帧了，不会真有人等着换图吧。
+        $Arg = $VFchainArgForSlide
     } else {
-        # 预览图（可调参数）
-        $Arg = "select=not(mod(n\,$frameInterval)),scale=-1:320,tile=3X4:padding=1:color=black"
+        $Arg = $VFchainArgForPreview
     }
+    return $Arg
+}
 
+# 动态选择 其他参数
+function Set-OtherArg {
+    param(
+        [Parameter(Mandatory=$true)]
+        [int]$durationInSeconds
+    )
+
+    # 其他参数（可调参数）
+    # 质量 -q:v 25 | 压缩 -compression_level 4 | 循环次数 -loop 0 | 覆盖文件 -y / -n
+    $otherArgForSlide = "-q:v 25 -compression_level 4 -loop 0 -n" # 动态图
+    $otherArgForPreview = "-lossless 0 -quality 40 -loop 0 -n" # 预览图
+
+    # 根据时长选择其他参数
+    if ($durationInSeconds -lt $durationLimit) {
+        $Arg = $otherArgForSlide
+    } else {
+        $Arg = $otherArgForPreview
+    }
     return $Arg
 }
 
 
 
 ##### 除非你知道你在做什么 #####
-
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
-Write-Host "起始目录: $($scriptDir)"
 
 # 定义函数来获取视频信息
 function Get-VideoDurationInSeconds {
@@ -130,6 +136,7 @@ function Get-VideoDurationInSeconds {
 
     return $durationInSeconds
 }
+
 function Get-VideoFramesPerSecond {
     param(
         [Parameter(Mandatory=$true)]
@@ -162,10 +169,13 @@ function Get-VideoFramesPerSecond {
 
 ##### Main #####
 
+# 获取脚本所在目录
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+Write-Host "起始目录: $($scriptDir)"
 # 定义一个数组
 $mediaFiles = @()
-# 使用Get-ChildItem命令递归查找当前目录及子目录下所有的 mkv、mp4、flv
-$mediaFiles += Get-ChildItem -Path . -Recurse -Include *.mkv,*.mp4,*.flv
+# 使用Get-ChildItem命令递归查找起始目录及子目录下所有的 mkv、mp4、flv
+$mediaFiles += Get-ChildItem -Path $scriptDir -Recurse -Include *.mkv,*.mp4,*.flv
 # 遍历找到的每个文件
 foreach ($file in $mediaFiles) {
     $inputFilePath = $file.FullName
@@ -174,15 +184,16 @@ foreach ($file in $mediaFiles) {
 
     Write-Host "视频文件: $inputFilePath" -ForegroundColor Yellow
     # 获取视频基础信息 - 时长 & 帧数
-    $V_Duration = Get-VideoDurationInSeconds -filePath $inputFilePath
-    $V_FPS = Get-VideoFramesPerSecond -filePath $inputFilePath
-    Write-Host "视频时长（秒）: $($V_Duration)  |  视频帧数: $($V_FPS)" -ForegroundColor Yellow
+    $videoinfo_Duration = Get-VideoDurationInSeconds -filePath $inputFilePath
+    $videoinfo_FPS = Get-VideoFramesPerSecond -filePath $inputFilePath
+    Write-Host "视频时长（秒）: $($videoinfo_Duration)  |  视频帧数: $($videoinfo_FPS)" -ForegroundColor Yellow
     # 动态选择参数 - 动态图/预览图
-    $adjustedFrameInterval = Set-AdjustFrameInterval -durationInSeconds $V_Duration -framePerSecond $V_FPS
-    $VFchainArg = Set-AdjustVFchainArg -frameInterval $adjustedFrameInterval
-    Write-Host "帧步长：$adjustedFrameInterval  |  VF参数: $VFchainArg  |  其他参数: $otherArg" -ForegroundColor Magenta
+    $FrameInterval = Set-FrameInterval -durationInSeconds $videoinfo_Duration -framePerSecond $videoinfo_FPS
+    $VFchainArg = Set-VFchainArg -frameInterval $FrameInterval
+    $otherArg = Set-OtherArg -durationInSeconds $videoinfo_Duration
+    Write-Host "帧步长：$FrameInterval  |  VF参数: $VFchainArg  |  其他参数: $otherArg" -ForegroundColor Magenta
 
-    ##### 转码阶段 #####
+    ##### 生成路径 #####
 
     # 分离文件路径的目录部分和文件名（不带扩展名）
     $directory = [System.IO.Path]::GetDirectoryName($inputFilePath)
@@ -197,6 +208,7 @@ foreach ($file in $mediaFiles) {
         New-Item -ItemType Directory -Path $outputDirectory -ErrorAction SilentlyContinue | Out-Null
     }
 
+    ##### 转码阶段 #####
     $ffmpegArgs = @{
         FilePath     = "$ffmpeg_path\ffmpeg.exe"
         ArgumentList = "-i `"$inputFilePath`" -vf `"$VFchainArg`" -c:v libwebp $otherArg `"$outputFilePath`""
